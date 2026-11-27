@@ -2,6 +2,7 @@
 fcbe_config.json
 fcbe_env/
 fcbe.zip
+.venv/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

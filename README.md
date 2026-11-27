@@ -103,18 +103,15 @@ Note that XKF1 includes messages relating to multiple IMUs if you have them.
 
 ## How do I get set up to contribute? ##
 ### Setup for Dev ###
-* Install the latest version of python (3.12 currently) from [Python Downloads](https://www.python.org/downloads/) or the Microsoft Store
 * Clone the repository
-* Start a command prompt (not powershell) in the cloned directory
-* Create a virtual environment and activate it
-~~~
-python -m venv fcbe_env
-fcbe_env\Scripts\activate.bat
-pip install -r requirements.txt
-~~~
+* In Visual Studio Code, install UV
+* uv venv
+* Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+* .venv\Scripts\activate
+* uv sync
 * You can now run fcbe
 ~~~
-python fcbe.py
+python3.15 fcbe.py
 ~~~
 
 ### Create a distributable ZIP ###
