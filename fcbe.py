@@ -19,8 +19,9 @@
 import json
 import os
 import tkinter as tk
+from pprint import pprint
 from tkinter import filedialog
-from typing import Dict, List, Union
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -34,22 +35,31 @@ Simplified representation of a 3D position at a time
 
 class Pos:
     def __init__(
-        s, Lat: float, Lng: float, Alt: float, timestamp: float = 0.0, index: int = 0
+        s,
+        Lat: float,
+        Lng: float,
+        Alt: float,
+        index: int = 0,
+        timeUS: int = 0,
     ):
         s.Lat = Lat
         s.Lng = Lng
         s.Alt = Alt
-        s.timestamp = timestamp
+        s.timeUS = int(timeUS)
         s.int = index
 
-    def get(s) -> Dict[str, Union[float, int]]:
+    def get(s) -> dict[str, float | int]:
         return {
             "Lat": s.Lat,
             "Lng": s.Lng,
             "Alt": s.Alt,
-            "timestamp": s.timestamp,
-            "index": s.index,
+            "TimeUS": s.timeUS,
+            "index": s.int,
         }
+
+    def get_dist_m(s, pos: "Pos") -> float:
+        distance_2d = geodesic((s.Lat, s.Lng), (pos.Lat, pos.Lng)).m
+        return np.sqrt(distance_2d**2 + (s.Alt - pos.Alt) ** 2)
 
     def __str__(s):
         return f"Lat: {round(s.Lat, 7)}  Lng: {round(s.Lng, 7)}  Alt: {round(s.Alt, 2)}"
@@ -102,101 +112,140 @@ Methods are generally in two categories:
 
 
 class FcLog:
-    def __init__(s, file_path: str, message_types: List[str]):
+    def __init__(s, file_path: str, message_types: list[str]):
         s.file_path = file_path
         s.message_types = message_types
+        s.is_valid = False
 
         # Parse the bin file and work out preferred position message type.
-        s.log = Ardupilot.parse(
-            bin_file=file_path, types=message_types, zero_time_base=True
-        )
-        s.pos_msg = None
+        try:
+            s.log = Ardupilot.parse(
+                bin_file=file_path, types=message_types, zero_time_base=True
+            )
+        except:  # noqa: E722
+            prnt(f"Unable to parse the BIN file at {file_path}")
+            prnt("Are you sure it is a valid Ardupilot log?")
+            return
+
         for m in ["POS", "XKF1", "GPS"]:
             try:
                 s.pos = s.log.dfs[m]
-            except:
-                pass
+            except KeyError, AttributeError:
+                s.pos = None
+                s.pos_msg = None
             else:
                 s.pos_msg = m
                 break
 
-        if s.pos_msg == None:
+        if s.pos is None:
             prnt("BIN file does not contain POS, XKF1 or GPS position messages.")
             prnt("Are you sure it is a valid Ardupilot log?")
             return
-
-        prnt(f"Using {s.pos_msg} messages for position info.")
+        elif s.pos.TimeUS[len(s.pos.TimeUS) - 1] < 10_000_000:
+            prnt("BIN file does not contain enough position messages.")
+            prnt("Are you sure it is a valid Ardupilot log?")
+            return
 
         # Find origin as a point 2.5s after records begin
-        t_range = s.get_pos_time_range_s()
-        s.origin = s.get_pos_at_time(t_range[0] + 2.5)
+        i = FcLog.nearest_index_to_time_us(s.pos, s.pos.TimeUS[0] + 2_500_000)
+        s.origin = Pos(
+            s.pos.Lat[i],
+            s.pos.Lng[i],
+            s.pos.Alt[i],
+            index=i,
+            timeUS=s.pos.TimeUS[i],
+        )
+
+        if s.origin is not None:
+            s.is_valid = True
 
     def __str__(s):
-        if s.pos_msg is None:
-            return "Log is empty or faulty."
+        if s.is_valid:
+            return f"Position message type: {s.pos_msg}\nOrigin: ({round(s.origin.timeUS / 1_000_000, 1)}s):  {s.origin}"
         else:
-            return f"Position message type: {s.pos_msg}\nOrigin: ({round(s.origin.timestamp, 1)}s):  {s.origin}"
+            return "Log is empty or faulty."
+
+    @staticmethod
+    def nearest_index_to_time_us(df: pd.DataFrame, t_us: int) -> int:
+        ts = df.TimeUS.to_numpy()
+        diff = np.fabs(np.subtract(t_us, ts))
+        where = np.where(diff == np.min(diff))
+        return int(where[0][0])
 
     # ---------------------------------------------------------------------
     # General log methods, dealing with any message type.
     # ---------------------------------------------------------------------
     # Get a log of a message type by name.
-    def get_msg_log(s, msg_type: str):
+    def get_msg_log(s, msg_type: str) -> pd.DataFrame | None:
         try:
             return s.log.dfs[msg_type]
-        except:
+        except KeyError:
             return None
 
-    # Given a time and a message type, return the index of the element with the nearest timestamp.
-    def get_msg_index_from_time_s(s, t_secs: float, msg_type: str) -> Union[int, None]:
+    # Given a time and a message type, return the index of the element with the nearest TimeUS.
+    def get_msg_index_from_time_us(s, t_us: int, msg_type: str) -> int | None:
         data = s.get_msg_log(msg_type)
-        if data is not None:
-            ts = data.timestamp.to_numpy()
-            diff = np.fabs(np.subtract(t_secs, ts))
-            where = np.where(diff == np.min(diff))
-            return int(where[0][0])
-        return None
+        return data if data is None else FcLog.nearest_index_to_time_us(data, t_us)
 
-    # Return minimum and maximum timestamps (seconds) for a message type.
-    def get_msg_time_range_s(s, msg_type: str) -> Union[List[float], None]:
+    # Return minimum and maximum TimeUS values for a message type.
+    def get_msg_time_range_us(s, msg_type: str) -> list[int] | None:
         data = s.get_msg_log(msg_type)
         if data is not None:
-            return [data.timestamp[0], data.timestamp[len(data.timestamp) - 1]]
+            return [
+                int(data.TimeUS[0]),
+                int(data.TimeUS[len(data.TimeUS) - 1]),
+            ]
         return None
 
     # ---------------------------------------------------------------------
     # Position-specific methods.
     # ---------------------------------------------------------------------
     # Get the full log of positions.
-    def get_pos_log(s) -> Union[pd.DataFrame, None]:
-        return s.pos
+    def get_pos_log(s) -> pd.DataFrame | None:
+        return s.pos if s.is_valid else None
 
     # Get position at a time
-    def get_pos_at_time(s, t: float) -> Pos:
-        i = s.get_pos_index_from_time_s(t)
-        return Pos(s.pos.Lat[i], s.pos.Lng[i], s.pos.Alt[i], s.pos.timestamp[i], i)
+    def get_pos_at_time_us(s, t_us: int) -> Pos | None:
+        if not s.is_valid or s.pos is None:
+            return None
+        i = s.get_pos_index_from_time_us(t_us)
+        return s.get_pos_at_index(i)
 
-    # Given a time, return the index of the position element with the nearest timestamp.
-    def get_pos_index_from_time_s(s, t_secs: float) -> Union[int, None]:
-        return s.get_msg_index_from_time_s(t_secs, s.pos_msg)
+    # Get position at a dataframe index.
+    def get_pos_at_index(s, i: int | None) -> Pos | None:
+        if not s.is_valid or s.pos is None or i is None:
+            return None
+        return Pos(
+            s.pos.Lat[i],
+            s.pos.Lng[i],
+            s.pos.Alt[i],
+            index=i,
+            timeUS=s.pos.TimeUS[i],
+        )
 
-    # Return the minimum and maximum position timestamps (seconds).
-    def get_pos_time_range_s(s) -> Union[List[float], None]:
-        return s.get_msg_time_range_s(s.pos_msg)
+    # Given a TimeUS value, return the nearest position index.
+    def get_pos_index_from_time_us(s, t_us: int) -> int | None:
+        if not s.is_valid or s.pos_msg is None:
+            return None
+        return s.get_msg_index_from_time_us(t_us, s.pos_msg)
+
+    # Return the minimum and maximum position TimeUS values.
+    def get_pos_time_range_us(s) -> list[int] | None:
+        if not s.is_valid or s.pos_msg is None:
+            return None
+        return s.get_msg_time_range_us(s.pos_msg)
 
     # Return the location record of the origin.
-    def get_origin(s) -> Pos:
+    def get_origin(s) -> Pos | None:
+        if not s.is_valid:
+            return None
         return s.origin
 
     # Return the distance in metres from the origin.
-    def get_dist_to_origin_m(s, pos: Pos) -> float:
-        return FcLog.get_dist_m(s.origin, pos)
-
-    # Distance between two position records.
-    @staticmethod
-    def get_dist_m(pos0: Pos, pos1: Pos) -> float:
-        distance_2d = geodesic((pos0.Lat, pos0.Lng), (pos1.Lat, pos1.Lng)).m
-        return np.sqrt(distance_2d**2 + (pos0.Alt - pos1.Alt) ** 2)
+    def get_dist_to_origin_m(s, pos: Pos) -> float | None:
+        if not s.is_valid or s.origin is None:
+            return None
+        return s.origin.get_dist_m(pos)
 
 
 """
@@ -227,7 +276,7 @@ def open_file() -> None:
 
     # Load it
     log = FcLog(file_path=file_path, message_types=config["open_file"]["message_types"])
-    if log is None:
+    if not log.is_valid:
         prnt(f"Unable to parse the BIN file at {file_path}")
         prnt("Are you sure it is a valid Ardupilot log?")
         return
@@ -250,7 +299,7 @@ Otherwise, it will use the switch transition times.
 
 def extract_box() -> None:
     global log, config, f3az
-    if log is None:
+    if log is not None and not log.is_valid:
         prnt("Please open a BIN file to be analysed.")
         return
     prnt()
@@ -269,23 +318,25 @@ def extract_box() -> None:
         return
 
     # Display the locations and combine into 5m clusters
-    t_origin = log.get_origin().timestamp
+    t_origin = log.get_origin().timeUS
     cluster = []
     for t in times:
         if t < t_origin:
             prnt(
-                f"Skippng time {round(t, 1)}s as it occurs before the origin time ({round(t_origin, 1)})"
+                f"Skippng time {round(t / 1_000_000, 1)}s as it occurs before the origin time ({round(t_origin / 1_000_000, 1)})"
             )
             continue
-        p = log.get_pos_at_time(t)
+        p = log.get_pos_at_time_us(t)
         d = log.get_dist_to_origin_m(p)
-        prnt(f"\nPosition at time {round(t, 1)}s, {round(d, 1)}m from origin:")
+        prnt(
+            f"\nPosition at time {round(t / 1_000_000, 1)}s, {round(d, 1)}m from origin:"
+        )
         prnt(f"{round(p.Lat, 7)}")
         prnt(f"{round(p.Lng, 7)}")
 
         found = False
         for i, c in enumerate(cluster):
-            if FcLog.get_dist_m(p, c) < 5.0:
+            if p.get_dist_m(c) < 5.0:
                 cluster[i] = p
                 found = True
                 break
@@ -309,7 +360,7 @@ There is no hysteresis or debounce, it doesn't seem to be necessary.
 """
 
 
-def find_rc_switch_times() -> List[float]:
+def find_rc_switch_times() -> list[int]:
     global log, config
 
     rc_str = f"C{config['find_rc_switch_times']['rc_switch_channel']}"
@@ -318,8 +369,8 @@ def find_rc_switch_times() -> List[float]:
     try:
         rcin = log.get_msg_log("RCIN")
         ppm = rcin[rc_str]
-        tim = rcin["timestamp"]
-        assert len(ppm) == len(tim)
+        tim_us = rcin["TimeUS"]
+        assert len(ppm) == len(tim_us)
     except:
         prnt(f"Log is missing RCIN messages for channel {rc_str}.")
     else:
@@ -327,7 +378,7 @@ def find_rc_switch_times() -> List[float]:
             now = ppm[i]
             next_now = ppm[i + 1]
             if (now < 1500 and next_now >= 1500) or (now >= 1500 and next_now < 1500):
-                switch_times.append(tim[i])
+                switch_times.append(int(tim_us[i]))
 
     prnt("Found " + str(len(switch_times)) + " switch transitions of channel " + rc_str)
     return switch_times
@@ -335,49 +386,54 @@ def find_rc_switch_times() -> List[float]:
 
 """
 Search for stationary periods in the log.
-To be classed as stationary, a sliding window of width window_secs
+To be classed as stationary, a sliding window of width window_us
 is applied to the 3D position, the vehicle must have moved less than
 tolerance_metres between the edges of the window.
 Hysteresis is applied when coming out of a stationary window.
 """
 
 
-def find_static_position_times() -> List[float]:
+def find_static_position_times() -> list[int]:
     global config, log
     cfg = config["find_static_position_times"]
-    window_secs = cfg["window_secs"]
+    window_us = (
+        int(cfg["window_us"])
+        if "window_us" in cfg
+        else int(cfg["window_secs"] * 1_000_000)
+    )
     tolerance_metres = cfg["tolerance_metres"]
     hysteresis = cfg["hysteresis"]
     switch_times = []
 
-    # Step through in 0.5s jumps
-    t_range = log.get_pos_time_range_s()
-    state = "find_start"
-    while (t_range[0] + window_secs) < t_range[1]:
-        p0 = log.get_pos_at_time(t_range[0])
-        p1 = log.get_pos_at_time(t_range[0] + window_secs)
-        distance = log.get_dist_m(p0, p1)
-        match state:
-            case "find_start":
-                if distance <= tolerance_metres:
-                    start = t_range[0]
-                    state = "find_end"
-            case "find_end":
-                if distance > tolerance_metres:
-                    end = t_range[0] + window_secs
-                    # Bias the actually measurement time towards the end of the period
-                    meas_time = start + ((end - start) * 0.7)
-                    prnt(
-                        f"Stationary between {round(start, 1)}s and {round(end, 1)}s, will measure at {round(meas_time, 1)}s"
-                    )
-                    switch_times.append(meas_time)
-                    state = "hysteresis"
-            case "hysteresis":
-                if distance > (tolerance_metres * hysteresis):
-                    state = "find_start"
-            case _:
-                break
-        t_range[0] = t_range[0] + 0.5
+    if log is not None:
+        # Step through in 500,000us jumps
+        t_range = log.get_pos_time_range_us()
+        state = "find_start"
+        while (t_range[0] + window_us) < t_range[1]:
+            p0 = log.get_pos_at_time_us(t_range[0])
+            p1 = log.get_pos_at_time_us(t_range[0] + window_us)
+            distance = p0.get_dist_m(p1)
+            match state:
+                case "find_start":
+                    if distance <= tolerance_metres:
+                        start = t_range[0]
+                        state = "find_end"
+                case "find_end":
+                    if distance > tolerance_metres:
+                        end = t_range[0] + window_us
+                        # Bias the actually measurement time towards the end of the period
+                        meas_time = start + ((end - start) * 0.7)
+                        prnt(
+                            f"Stationary between {round(start / 1_000_000, 1)}s and {round(end / 1_000_000, 1)}s, will measure at {round(meas_time / 1_000_000, 1)}s"
+                        )
+                        switch_times.append(int(meas_time))
+                        state = "hysteresis"
+                case "hysteresis":
+                    if distance > (tolerance_metres * hysteresis):
+                        state = "find_start"
+                case _:
+                    break
+            t_range[0] = t_range[0] + 500_000
 
     return switch_times
 
@@ -403,6 +459,10 @@ def save_box() -> None:
         initialfile=f"{((config['open_file']['file']).split('.'))[0]}.f3a",
         filetypes=[("F3A Zone", ".f3a")],
     )
+
+    if file_path == "":
+        prnt("No file path chosen, box not saved.")
+        return
 
     f3az.write(file_path)
     prnt(f"Box written to {file_path}")
@@ -456,14 +516,14 @@ def message_rates() -> None:
         except:
             prnt(f"{msg}: not found in the log")
         else:
-            t_range = log.get_msg_time_range_s(msg)
-            period = (t_range[1] - t_range[0]) / n_msgs
-            if period > 0:
-                freqHz = 1 / period
+            t_range_us = log.get_msg_time_range_us(msg)
+            period_us = (t_range_us[1] - t_range_us[0]) / n_msgs
+            if period_us > 0:
+                freqHz = 1_000_000 / period_us
             else:
                 freqHz = 0
             prnt(
-                f"{msg}:  {n_msgs} messages at {round(freqHz, 1)}Hz ({round(period * 1000, 1)}ms)"
+                f"{msg}:  {n_msgs} messages at {round(freqHz, 1)}Hz ({round(period_us / 1000, 1)}ms)"
             )
 
     return
@@ -502,7 +562,7 @@ Given a numpy array of numbers, find the min, mean and max of the middle 70% of 
 """
 
 
-def min_avg_max(arr: np.array, precis: int = 1) -> List[float]:
+def min_avg_max(arr: np.ndarray, precis: int = 1) -> list[float]:
     length = len(arr)
     if length < 1000:
         return [0.0, 0.0, 0.0]
@@ -523,7 +583,7 @@ Write out config as json file
 """
 
 
-def write_config(path: str, cfg: Dict) -> None:
+def write_config(path: str, cfg: dict[str, Any]) -> None:
     with open(path, "w") as json_file:
         json.dump(cfg, json_file, indent=3)
     return
@@ -542,7 +602,7 @@ def create_default_config_file(path: str) -> None:
         },
         "find_rc_switch_times": {"rc_switch_channel": 0},
         "find_static_position_times": {
-            "window_secs": 8.0,
+            "window_us": 8_000_000,
             "tolerance_metres": 1.0,
             "hysteresis": 3,
         },

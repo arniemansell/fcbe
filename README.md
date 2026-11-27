@@ -111,7 +111,7 @@ Note that XKF1 includes messages relating to multiple IMUs if you have them.
 * uv sync
 * You can now run fcbe
 ~~~
-python3.15 fcbe.py
+python fcbe.py
 ~~~
 
 ### Create a distributable ZIP ###
